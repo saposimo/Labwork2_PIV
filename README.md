@@ -1,4 +1,4 @@
-# PIV Project 1
+# PIV Project 2
 
 Computer Vision project for image processing and 3D reconstruction.
 
