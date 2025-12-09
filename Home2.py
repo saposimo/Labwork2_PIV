@@ -1,475 +1,462 @@
+"""
+Lab Work 2 – NUMPY-ONLY GEOMETRY PIPELINE
+------------------------------------------
+Allowed:    SIFT, BFMatcher from OpenCV
+Forbidden:  All OpenCV geometry (Essential, Pose, Triangulation, Homography, Warp)
+Everything else must be implemented with NumPy/SciPy.
+"""
+
 import numpy as np
-import matplotlib.pyplot as plt
 import cv2
-
-# NOTE: Usare solo NumPy/SciPy per tutto il pipeline eccetto feature detection/matching (SIFT/BFMatcher).
-
-# ==============================================================================
-# LOAD IMAGES
-# ==============================================================================
-
-# Images (BGR for OpenCV)
-img1_bgr = cv2.imread("320.jpg", cv2.IMREAD_COLOR)
-img2_bgr = cv2.imread("330.jpg", cv2.IMREAD_COLOR)
-
-if img1_bgr is None or img2_bgr is None:
-    raise FileNotFoundError("Assicurati che 320.jpg e 330.jpg siano nella cartella corrente")
-
-# Convert to RGB for plotting (solo per matplotlib)
-img1 = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2RGB)
-img2 = cv2.cvtColor(img2_bgr, cv2.COLOR_BGR2RGB)
-
-# Camera intrinsics (stima)
-H, W = img1.shape[:2]
-fx = fy = 1180.0
-cx = W / 2.0
-cy = H / 2.0
-K = np.array([[fx, 0, cx],
-              [0, fy, cy],
-              [0,  0,  1]], dtype=np.float64)
-
-print(f"Image size: {W}x{H}")
-print("K =\n", K)
+import matplotlib.pyplot as plt
+from pathlib import Path
 
 # ==============================================================================
-# SIFT + MATCHES
+# CONFIGURATION (EDITABLE)
 # ==============================================================================
 
-def sift_keypoints_and_matches(im1, im2, ratio=0.75):
-    """
-    Trova keypoints SIFT e matcha i descrittori tra im1 e im2.
-    Ritorna:
-        pts1: punti 2D in im1
-        pts2: punti 2D in im2
-        good: lista di match buoni
-        kp1, kp2: keypoints completi
-    """
+CONFIG = {
+    "ref_name": "lisbon_0001.jpg",     # reference image
+    "prefix": "lisbon_",               # load only prefixXXX.jpg
+    "max_images": 2,                  # max number of images to load
+    "fx_fy": 1180.0,                   # camera intrinsics guess
+    "ransac_E_thresh": 1e-3,           # RANSAC threshold for Essential
+    "ransac_H_thresh": 4.0,            # RANSAC threshold for homography
+    "ransac_iters": 2000,
+}
+
+# ==============================================================================
+# IMAGE LOADING
+# ==============================================================================
+
+def load_image_sequence(ref_name, prefix, max_images):
+    """Load reference first, then all other prefix*.jpg images."""
+    files = sorted(Path(".").glob(f"{prefix}*.jpg"))
+    seq = []
+    for f in files:
+        name = f.name
+        img = cv2.imread(str(f), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        if name == ref_name:
+            seq.insert(0, (img, name))
+        else:
+            seq.append((img, name))
+        if len(seq) >= max_images:
+            break
+
+    if len(seq) == 0 or seq[0][1] != ref_name:
+        raise FileNotFoundError(f"Reference '{ref_name}' not found.")
+
+    return seq
+
+
+# ==============================================================================
+# FEATURE MATCHING (allowed)
+# ==============================================================================
+
+def sift_match(img1, img2, ratio=0.75):
     sift = cv2.SIFT_create()
-    kp1, des1 = sift.detectAndCompute(im1, None)
-    kp2, des2 = sift.detectAndCompute(im2, None)
+    kp1, d1 = sift.detectAndCompute(img1, None)
+    kp2, d2 = sift.detectAndCompute(img2, None)
 
-    matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-    raw_matches = matcher.knnMatch(des1, des2, k=2)
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    raw = matcher.knnMatch(d1, d2, k=2)
 
     good = []
-    for m, n in raw_matches:
+    for m, n in raw:
         if m.distance < ratio * n.distance:
             good.append(m)
 
     pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
-    return pts1, pts2, good, kp1, kp2
+    return pts1, pts2
 
 
-pts1, pts2, good_matches, kp1, kp2 = sift_keypoints_and_matches(img1_bgr, img2_bgr)
-print(f"SIFT matches (ratio-tested): {len(good_matches)}")
+# ==============================================================================
+# CAMERA NORMALIZATION
+# ==============================================================================
 
-################################################################################
-# ESSENTIAL MATRIX, POSE, TRIANGULATION (NumPy only)
-################################################################################
-
-def _to_normalized(pts_px, K):
-    """Convert pixel coords to normalized camera coords (homogeneous division)."""
-    pts_h = np.column_stack([pts_px, np.ones(len(pts_px))])  # (N,3)
-    K_inv = np.linalg.inv(K)
-    pts_norm = (K_inv @ pts_h.T).T
-    return pts_norm[:, :2]
+def to_normalized(pts, K):
+    pts_h = np.column_stack([pts, np.ones(len(pts))])
+    Kinv = np.linalg.inv(K)
+    p = (Kinv @ pts_h.T).T
+    return p[:, :2]
 
 
-def _eight_point_E(pts1_n, pts2_n):
-    """Classic 8-point algorithm (normalized points)."""
-    n = pts1_n.shape[0]
-    A = np.zeros((n, 9))
-    x1, y1 = pts1_n[:, 0], pts1_n[:, 1]
-    x2, y2 = pts2_n[:, 0], pts2_n[:, 1]
-    A[:, 0] = x2 * x1
-    A[:, 1] = x2 * y1
-    A[:, 2] = x2
-    A[:, 3] = y2 * x1
-    A[:, 4] = y2 * y1
-    A[:, 5] = y2
-    A[:, 6] = x1
-    A[:, 7] = y1
-    A[:, 8] = 1.0
+# ==============================================================================
+# ESSENTIAL MATRIX  - eight-point + RANSAC (NUMPY)
+# ==============================================================================
+
+def eight_point_E(pts1, pts2):
+    """8pt algorithm (after normalization). Enforce rank-2."""
+    x1, y1 = pts1[:, 0], pts1[:, 1]
+    x2, y2 = pts2[:, 0], pts2[:, 1]
+
+    A = np.column_stack([
+        x2 * x1, x2 * y1, x2,
+        y2 * x1, y2 * y1, y2,
+        x1, y1, np.ones(len(pts1))
+    ])
 
     _, _, Vt = np.linalg.svd(A)
     E = Vt[-1].reshape(3, 3)
 
-    # Enforce rank-2 with singular values (1,1,0)
-    U, S, Vt = np.linalg.svd(E)
-    S = [1.0, 1.0, 0.0]
-    E = U @ np.diag(S) @ Vt
-    return E
+    # rank-2 enforcement
+    U, _, Vt = np.linalg.svd(E)
+    S = np.diag([1, 1, 0])
+    return U @ S @ Vt
 
 
-def _sampson_error(E, pts1_n, pts2_n):
-    """Sampson distance for essential matrix on normalized points."""
-    x1 = np.column_stack([pts1_n, np.ones(len(pts1_n))])
-    x2 = np.column_stack([pts2_n, np.ones(len(pts2_n))])
+def sampson_error(E, pts1, pts2):
+    """Sampson distance for essential."""
+    x1 = np.column_stack([pts1, np.ones(len(pts1))])
+    x2 = np.column_stack([pts2, np.ones(len(pts2))])
 
-    Ex1 = E @ x1.T  # (3,N)
-    Etx2 = E.T @ x2.T  # (3,N)
+    Ex1 = E @ x1.T
+    Etx2 = E.T @ x2.T
     x2tEx1 = np.sum(x2 * (E @ x1.T).T, axis=1)
 
     num = x2tEx1 ** 2
-    denom = Ex1[0] ** 2 + Ex1[1] ** 2 + Etx2[0] ** 2 + Etx2[1] ** 2 + 1e-12
-    return num / denom
+    den = Ex1[0]**2 + Ex1[1]**2 + Etx2[0]**2 + Etx2[1]**2 + 1e-12
+    return num / den
 
 
-def estimate_E_numpy(pts1_px, pts2_px, K, ransac_thresh=1e-3, max_iters=2000):
-    """Estimate Essential matrix via 8-point + RANSAC using NumPy only."""
-    if len(pts1_px) < 8:
-        raise RuntimeError("Not enough points for E estimation")
+def estimate_E_ransac(pts1, pts2, K, thresh, iters):
+    """NumPy-only RANSAC for Essential E."""
+    pts1n = to_normalized(pts1, K)
+    pts2n = to_normalized(pts2, K)
+    N = len(pts1)
 
-    pts1_n = _to_normalized(pts1_px, K)
-    pts2_n = _to_normalized(pts2_px, K)
+    best_E, best_inliers = None, np.zeros(N, bool)
 
-    best_inliers = None
-    best_E = None
-    n = len(pts1_n)
+    for _ in range(iters):
+        idx = np.random.choice(N, 8, replace=False)
+        E_candidate = eight_point_E(pts1n[idx], pts2n[idx])
+        err = sampson_error(E_candidate, pts1n, pts2n)
+        inl = err < thresh
 
-    for _ in range(max_iters):
-        idx = np.random.choice(n, 8, replace=False)
-        E_candidate = _eight_point_E(pts1_n[idx], pts2_n[idx])
-        err = _sampson_error(E_candidate, pts1_n, pts2_n)
-        inliers = err < ransac_thresh
-        if best_inliers is None or inliers.sum() > best_inliers.sum():
-            best_inliers = inliers
+        if inl.sum() > best_inliers.sum():
+            best_inliers = inl
             best_E = E_candidate
 
-    # Refine with all inliers
-    if best_inliers is None or best_inliers.sum() < 8:
-        raise RuntimeError("RANSAC failed to find a valid E")
-    E_refined = _eight_point_E(pts1_n[best_inliers], pts2_n[best_inliers])
-    return E_refined, best_inliers
+    if best_E is None:
+        raise RuntimeError("RANSAC failed for Essential.")
+
+    # refine
+    E_ref = eight_point_E(pts1n[best_inliers], pts2n[best_inliers])
+    return E_ref, best_inliers
 
 
-def recover_pose_numpy(E, pts1_px, pts2_px, K):
-    """Recover R,t from E using cheirality check (NumPy only)."""
-    pts1_n = _to_normalized(pts1_px, K)
-    pts2_n = _to_normalized(pts2_px, K)
+# ==============================================================================
+# POSE RECOVERY FROM ESSENTIAL (NUMPY)
+# ==============================================================================
+
+def recover_pose(E, pts1, pts2, K):
+    pts1n = to_normalized(pts1, K)
+    pts2n = to_normalized(pts2, K)
 
     U, _, Vt = np.linalg.svd(E)
     if np.linalg.det(U @ Vt) < 0:
         Vt = -Vt
 
-    W = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+    W = np.array([[0,-1,0],[1,0,0],[0,0,1]])
 
     candidates = [
-        (U @ W @ Vt, U[:, 2]),
-        (U @ W @ Vt, -U[:, 2]),
-        (U @ W.T @ Vt, U[:, 2]),
-        (U @ W.T @ Vt, -U[:, 2]),
+        (U @ W @ Vt,  U[:,2]),
+        (U @ W @ Vt, -U[:,2]),
+        (U @ W.T @ Vt,  U[:,2]),
+        (U @ W.T @ Vt, -U[:,2]),
     ]
 
-    def triangulate_points_numpy(pts1n, pts2n, R, t):
-        P1 = np.hstack([np.eye(3), np.zeros((3, 1))])
-        P2 = np.hstack([R, t.reshape(3, 1)])
-        pts_3d = []
-        for (u1, v1), (u2, v2) in zip(pts1n, pts2n):
+    def triangulate(R,t):
+        P1 = np.hstack([np.eye(3), np.zeros((3,1))])
+        P2 = np.hstack([R, t.reshape(3,1)])
+        pts3d = []
+        for (u1,v1),(u2,v2) in zip(pts1n, pts2n):
             A = np.array([
-                u1 * P1[2] - P1[0],
-                v1 * P1[2] - P1[1],
-                u2 * P2[2] - P2[0],
-                v2 * P2[2] - P2[1],
+                u1*P1[2]-P1[0],
+                v1*P1[2]-P1[1],
+                u2*P2[2]-P2[0],
+                v2*P2[2]-P2[1]
             ])
-            _, _, Vt_tri = np.linalg.svd(A)
-            X = Vt_tri[-1]
-            X = X[:3] / X[3]
-            pts_3d.append(X)
-        return np.array(pts_3d)
+            _,_,VtA = np.linalg.svd(A)
+            X = VtA[-1]
+            X = X[:3]/X[3]
+            pts3d.append(X)
+        return np.array(pts3d)
 
-    best_count = -1
-    best_R, best_t = None, None
+    best_R, best_t, best_count = None, None, -1
 
-    for R_cand, t_cand in candidates:
-        pts_3d = triangulate_points_numpy(pts1_n, pts2_n, R_cand, t_cand)
-        if pts_3d.size == 0:
-            continue
-        z1 = pts_3d[:, 2]
-        pts_cam2 = (R_cand @ pts_3d.T + t_cand.reshape(3, 1)).T
-        z2 = pts_cam2[:, 2]
-        positive = (z1 > 0) & (z2 > 0)
-        count = positive.sum()
-        if count > best_count:
-            best_count = count
-            best_R, best_t = R_cand, t_cand
+    for R,t in candidates:
+        pts = triangulate(R,t)
+        z1 = pts[:,2]
+        z2 = (R @ pts.T + t.reshape(3,1))[2]
+        in_front = (z1>0) & (z2>0)
+        if in_front.sum() > best_count:
+            best_R, best_t, best_count = R, t, in_front.sum()
 
-    if best_R is None:
-        raise RuntimeError("Failed to recover pose")
-
-    # Keep only points in front of both cameras for downstream steps
-    pts_3d_final = triangulate_points_numpy(pts1_n, pts2_n, best_R, best_t)
-    z1 = pts_3d_final[:, 2]
-    pts_cam2 = (best_R @ pts_3d_final.T + best_t.reshape(3, 1)).T
-    z2 = pts_cam2[:, 2]
-    cheirality_mask = (z1 > 0) & (z2 > 0)
-
-    return best_R, best_t, cheirality_mask, pts_3d_final
+    return best_R, best_t
 
 
-def triangulate_points_numpy(pts1_px, pts2_px, K, R, t):
-    """Triangulation in camera-1 frame using only NumPy."""
-    pts1_n = _to_normalized(pts1_px, K)
-    pts2_n = _to_normalized(pts2_px, K)
-    P1 = np.hstack([np.eye(3), np.zeros((3, 1))])
-    P2 = np.hstack([R, t.reshape(3, 1)])
+def triangulate_points(pts1, pts2, K, R, t):
+    """Triangulate all inliers (NumPy)."""
+    pts1n = to_normalized(pts1, K)
+    pts2n = to_normalized(pts2, K)
 
-    pts_3d = []
-    for (u1, v1), (u2, v2) in zip(pts1_n, pts2_n):
+    P1 = np.hstack([np.eye(3), np.zeros((3,1))])
+    P2 = np.hstack([R, t.reshape(3,1)])
+
+    out = []
+    for (u1,v1),(u2,v2) in zip(pts1n, pts2n):
         A = np.array([
-            u1 * P1[2] - P1[0],
-            v1 * P1[2] - P1[1],
-            u2 * P2[2] - P2[0],
-            v2 * P2[2] - P2[1],
+            u1*P1[2]-P1[0],
+            v1*P1[2]-P1[1],
+            u2*P2[2]-P2[0],
+            v2*P2[2]-P2[1],
         ])
-        _, _, Vt = np.linalg.svd(A)
+        _,_,Vt = np.linalg.svd(A)
         X = Vt[-1]
-        X = X[:3] / X[3]
-        pts_3d.append(X)
-    pts_3d = np.array(pts_3d)
+        X = X[:3]/X[3]
+        out.append(X)
+    return np.array(out)
 
-    z1 = pts_3d[:, 2]
-    pts_cam2 = (R @ pts_3d.T + t.reshape(3, 1)).T
-    z2 = pts_cam2[:, 2]
-    mask = (z1 > 0) & (z2 > 0)
-    return pts_3d[mask]
-
-
-# --- Run estimation pipeline (NumPy) ---
-E_est, inliers_E = estimate_E_numpy(pts1, pts2, K)
-pts1_E = pts1[inliers_E]
-pts2_E = pts2[inliers_E]
-
-R_est, t_est, cheirality_mask, pts3d_full = recover_pose_numpy(E_est, pts1_E, pts2_E, K)
-pts1_in = pts1_E[cheirality_mask]
-pts2_in = pts2_E[cheirality_mask]
-points_3d = pts3d_full[cheirality_mask]
-
-print("Estimated R:\n", R_est)
-print("Estimated t:\n", t_est)
-print(f"Inliers after E-RANSAC: {len(pts1_E)}")
-print(f"Cheirality-consistent points: {len(points_3d)}")
-
-# Visualizzazione rapida della nuvola 3D
-fig = plt.figure(figsize=(10, 5))
-ax1 = fig.add_subplot(1, 2, 1)
-ax1.imshow(img1)
-ax1.set_title("Image 1 (RGB)")
-ax1.axis("off")
-
-ax2 = fig.add_subplot(1, 2, 2, projection='3d')
-ax2.scatter(points_3d[:, 0], points_3d[:, 1], points_3d[:, 2],
-            s=1, c=points_3d[:, 2], cmap='viridis')
-ax2.set_title("Triangulated 3D (cam1 frame)")
-ax2.set_xlabel("X")
-ax2.set_ylabel("Y")
-ax2.set_zlabel("Z")
-plt.tight_layout()
-plt.show()
 
 # ==============================================================================
-# HOMOGRAPHY COMPUTATION FOR IMAGE SEQUENCE
+# HOMOGRAPHY (DLT + RANSAC, NUMPY)
 # ==============================================================================
 
-def normalize_points(points):
-    """Hartley normalization for homography/8pt DLT."""
-    centroid = np.mean(points, axis=0)
-    shifted = points - centroid
-    mean_dist = np.mean(np.sqrt(np.sum(shifted**2, axis=1))) + 1e-12
-    scale = np.sqrt(2) / mean_dist
+def normalize_h(points):
+    c = np.mean(points, axis=0)
+    s = np.sqrt(2) / (np.mean(np.linalg.norm(points - c, axis=1)) + 1e-12)
+
     T = np.array([
-        [scale, 0, -scale * centroid[0]],
-        [0, scale, -scale * centroid[1]],
-        [0, 0, 1],
+        [s,0,-s*c[0]],
+        [0,s,-s*c[1]],
+        [0,0,1],
     ])
     pts_h = np.column_stack([points, np.ones(len(points))])
-    pts_norm = (T @ pts_h.T).T
-    return pts_norm[:, :2], T
+    ptsn = (T @ pts_h.T).T
+    return ptsn[:,:2], T
 
 
-def compute_homography_dlt(src_pts, dst_pts):
-    """DLT homography from normalized points."""
-    n = len(src_pts)
+def H_from_dlt(p1, p2):
     A = []
-    for i in range(n):
-        x, y = src_pts[i]
-        xp, yp = dst_pts[i]
-        A.append([-x, -y, -1, 0, 0, 0, x * xp, y * xp, xp])
-        A.append([0, 0, 0, -x, -y, -1, x * yp, y * yp, yp])
-    A = np.array(A)
-    _, _, Vt = np.linalg.svd(A)
-    H = Vt[-1].reshape(3, 3)
-    return H / (H[2, 2] + 1e-12)
+    for (x,y),(xp,yp) in zip(p1,p2):
+        A.append([-x,-y,-1,0,0,0,x*xp,y*xp,xp])
+        A.append([0,0,0,-x,-y,-1,x*yp,y*yp,yp])
+    _,_,Vt = np.linalg.svd(np.array(A))
+    H = Vt[-1].reshape(3,3)
+    return H / (H[2,2]+1e-12)
 
 
-def find_homography_ransac(src_pts, dst_pts, threshold=5.0, max_iterations=2000):
-    """NumPy-only RANSAC for homography."""
-    if len(src_pts) < 4:
-        return None, None
+def ransac_homography(pts_src, pts_dst, thresh, iters):
+    N = len(pts_src)
+    best_H, best_inl = None, None
 
-    src_pts = np.asarray(src_pts, dtype=float)
-    dst_pts = np.asarray(dst_pts, dtype=float)
+    p1n, T1 = normalize_h(pts_src)
+    p2n, T2 = normalize_h(pts_dst)
 
-    best_H, best_inliers = None, None
-    N = len(src_pts)
+    for _ in range(iters):
+        idx = np.random.choice(N, 4, False)
+        Htilde = H_from_dlt(p1n[idx], p2n[idx])
+        Hcand = np.linalg.inv(T2) @ Htilde @ T1
 
-    # Pre-normalize all points once
-    src_norm_all, T_src = normalize_points(src_pts)
-    dst_norm_all, T_dst = normalize_points(dst_pts)
+        src_h = np.column_stack([pts_src, np.ones(N)])
+        proj = (Hcand @ src_h.T).T
+        proj = proj[:,:2]/(proj[:,2:3]+1e-12)
 
-    for _ in range(max_iterations):
-        idx = np.random.choice(N, 4, replace=False)
-        H_tilde = compute_homography_dlt(src_norm_all[idx], dst_norm_all[idx])
-        H_candidate = np.linalg.inv(T_dst) @ H_tilde @ T_src
+        err = np.linalg.norm(proj - pts_dst, axis=1)
+        inl = err < thresh
 
-        # Reproject src -> dst
-        src_h = np.column_stack([src_pts, np.ones(N)])
-        proj = (H_candidate @ src_h.T).T
-        proj = proj[:, :2] / (proj[:, 2:3] + 1e-12)
-        err = np.linalg.norm(proj - dst_pts, axis=1)
-        inliers = err < threshold
+        if best_inl is None or inl.sum() > best_inl.sum():
+            best_inl = inl
+            best_H = Hcand
 
-        if best_inliers is None or inliers.sum() > best_inliers.sum():
-            best_inliers = inliers
-            best_H = H_candidate
-
-    if best_H is None:
-        return None, None
-
-    # Optional re-fit on inliers
-    src_in = src_pts[best_inliers]
-    dst_in = dst_pts[best_inliers]
-    src_norm_in, T_src_in = normalize_points(src_in)
-    dst_norm_in, T_dst_in = normalize_points(dst_in)
-    H_tilde = compute_homography_dlt(src_norm_in, dst_norm_in)
-    best_H = np.linalg.inv(T_dst_in) @ H_tilde @ T_src_in
-
-    return best_H, best_inliers
+    return best_H, best_inl
 
 
-def warp_image_numpy(src_img, H, output_shape):
-    """Warp image using homography H (NumPy only, nearest-neighbor)."""
-    h_out, w_out = output_shape
-    h_src, w_src = src_img.shape[:2]
+# ==============================================================================
+# WARPING (NUMPY)
+# ==============================================================================
+
+def warp_numpy(img, H, out_wh):
+    h_out, w_out = out_wh
+    h, w = img.shape[:2]
 
     u_dst, v_dst = np.meshgrid(np.arange(w_out), np.arange(h_out))
-    coords_dst_h = np.stack([u_dst.flatten(), v_dst.flatten(), np.ones(u_dst.size)])
+    pts = np.stack([u_dst.ravel(), v_dst.ravel(), np.ones(u_dst.size)])
 
-    H_inv = np.linalg.inv(H)
-    coords_src_h = H_inv @ coords_dst_h
-    coords_src_h /= (coords_src_h[2, :] + 1e-12)
+    Hinv = np.linalg.inv(H)
+    src = Hinv @ pts
+    src /= src[2] + 1e-12
+    u, v = src[0].astype(int), src[1].astype(int)
 
-    u_src = coords_src_h[0, :].astype(int)
-    v_src = coords_src_h[1, :].astype(int)
+    mask = (u>=0)&(u<w)&(v>=0)&(v<h)
+    out = np.zeros((h_out,w_out,3), img.dtype)
+    out[v_dst.ravel()[mask], u_dst.ravel()[mask]] = img[v[mask], u[mask]]
+    return out
 
-    mask = (u_src >= 0) & (u_src < w_src) & (v_src >= 0) & (v_src < h_src)
+def blend_numpy(base_img, new_img, alpha=0.5):
+    """
+    Fonde new_img dentro base_img solo dove new_img è valido (non nero).
+    Tutto in NumPy, niente OpenCV.
+    base_img, new_img: BGR, stessa shape.
+    """
+    out = base_img.copy()
+    # pixel validi: non tutti e tre i canali a zero
+    mask = np.any(new_img != 0, axis=2)
 
-    warped = np.zeros((h_out, w_out, src_img.shape[2]), dtype=src_img.dtype)
-    dest_y = coords_dst_h[1, :].astype(int)[mask]
-    dest_x = coords_dst_h[0, :].astype(int)[mask]
-    warped[dest_y, dest_x] = src_img[v_src[mask], u_src[mask]]
+    # blending solo sulla maschera
+    base = base_img.astype(np.float32)
+    new = new_img.astype(np.float32)
 
-    return warped
+    out[mask] = (alpha * base[mask] + (1.0 - alpha) * new[mask]).astype(np.uint8)
+    return out
 
 
-# ------------------------------------------------------------------------------
-# Sequence (per ora solo 320 e 330)
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# MAIN PIPELINE
+# ==============================================================================
 
-image_sequence = [
-    (img1_bgr, "320.jpg"),
-    (img2_bgr, "330.jpg"),
-]
+def run_pipeline(config=CONFIG):
+    print("\nLoading image sequence...")
+    seq = load_image_sequence(config["ref_name"], config["prefix"], config["max_images"])
 
-ref_name = "320.jpg"
-ref_img = img1_bgr
-print("\n--- Homography Sequence Processing ---")
-print(f"Reference image: {ref_name}")
+    # intrinsics
+    first_img = seq[0][0]
+    H_img, W_img = first_img.shape[:2]
+    fx = fy = config["fx_fy"]
+    cx, cy = W_img/2, H_img/2
+    K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]])
 
-homographies = {}
-inlier_counts = {}
+    print("K =\n", K)
 
-for img, img_name in image_sequence:
-    if img_name == ref_name:
-        H_identity = np.eye(3)
-        homographies[img_name] = H_identity
-        inlier_counts[img_name] = len(pts1_in)
-        print(f"{img_name} -> {ref_name}: Identity (reference)")
-    else:
-        # Homography 330 -> 320 using NumPy RANSAC
-        H_330_to_320, mask_H = find_homography_ransac(
-            pts2_in,  # src (330)
-            pts1_in,  # dst (320)
-            threshold=5.0,
-            max_iterations=2000,
+    # ----------------------------------------------------------
+    # E / Pose / Triangulation (use first two images only)
+    # ----------------------------------------------------------
+    print("\n--- SIFT Matching (ref <-> next) ---")
+    pts1, pts2 = sift_match(seq[0][0], seq[1][0])
+    print(f"Matches: {len(pts1)}")
+
+    print("\n--- Essential via RANSAC (NumPy) ---")
+    E, inlE = estimate_E_ransac(
+        pts1, pts2,
+        K,
+        config["ransac_E_thresh"],
+        config["ransac_iters"]
+    )
+    pts1E, pts2E = pts1[inlE], pts2[inlE]
+    print(f"Inliers (E): {inlE.sum()}")
+
+    print("\n--- Recover Pose (NumPy) ---")
+    R, t = recover_pose(E, pts1E, pts2E, K)
+    print("R=\n", R)
+    print("t=\n", t)
+
+    print("\n--- Triangulate (NumPy) ---")
+    pts3d = triangulate_points(pts1E, pts2E, K, R, t)
+    print(f"3D points: {len(pts3d)}")
+
+        # ----------------------------------------------------------
+    # Homographies for entire sequence
+    # ----------------------------------------------------------
+    print("\n--- Homographies to reference ---")
+    ref_img_bgr = seq[0][0]
+    ref_name = seq[0][1]
+
+    homos = {ref_name: np.eye(3)}
+    inliers_H = {ref_name: len(pts1E)}
+
+    for img, name in seq[1:]:
+        pts_ref, pts_tgt = sift_match(ref_img_bgr, img)
+        Hmat, inl = ransac_homography(
+            pts_tgt, pts_ref,
+            config["ransac_H_thresh"],
+            config["ransac_iters"]
         )
-
-        if H_330_to_320 is not None:
-            homographies[img_name] = H_330_to_320
-            n_inliers = int(mask_H.sum()) if mask_H is not None else len(pts1_in)
-            inlier_counts[img_name] = n_inliers
-            print(f"{img_name} -> {ref_name}: H computed ({n_inliers} inliers)")
-            print("H =\n", H_330_to_320, "\n")
+        if Hmat is not None:
+            homos[name] = Hmat
+            inliers_H[name] = int(inl.sum())
+            print(f"{name} -> {ref_name} : {inliers_H[name]} inliers")
         else:
-            print(f"Failed to compute homography for {img_name}")
+            print(f"Failed for {name}")
 
-# ==============================================================================
-# VISUALIZATION: WARP + OVERLAY
-# ==============================================================================
+    # ----------------------------------------------------------
+    # Visualization – second image (reference + warped + overlay)
+    # ----------------------------------------------------------
+    canvas_hw = (H_img, W_img)   # (height, width)
+    second_img_bgr, second_name = seq[1]
 
-# Canvas = stessa dimensione della reference
-canvas_size = (W, H)  # (width, height)
+    print("\nWarping second image into reference frame...")
 
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    warped2_bgr = warp_numpy(second_img_bgr, homos[second_name], canvas_hw)
+    overlay2_bgr = blend_numpy(ref_img_bgr, warped2_bgr, alpha=0.5)
 
-# (1) Immagine di riferimento
-axes[0, 0].imshow(img1)
-axes[0, 0].set_title("Reference: 320.jpg")
-axes[0, 0].axis("off")
+    fig, ax = plt.subplots(1, 4, figsize=(18, 5))
 
-# (2) Immagine 330 originale
-axes[0, 1].imshow(img2)
-axes[0, 1].set_title("Original: 330.jpg")
-axes[0, 1].axis("off")
+    # 1) Reference
+    ax[0].imshow(ref_img_bgr[:, :, ::-1])  # BGR -> RGB
+    ax[0].set_title("Reference")
+    ax[0].axis("off")
 
-# (3) 330 warppata nel frame di 320
-warped_330 = None
-if "330.jpg" in homographies:
-    H_330_to_320 = homographies["330.jpg"]
-    warped_330 = warp_image_numpy(img2_bgr, H_330_to_320, (H, W))
-    axes[1, 0].imshow(warped_330[:, :, ::-1])  # BGR -> RGB
-    axes[1, 0].set_title(f"330 warped -> 320 frame\n({inlier_counts['330.jpg']} inliers)")
-else:
-    axes[1, 0].text(0.5, 0.5, "Homography failed",
-                    ha='center', va='center', fontsize=12)
-axes[1, 0].axis("off")
+    # 2) Original second
+    ax[1].imshow(second_img_bgr[:, :, ::-1])
+    ax[1].set_title("Original")
+    ax[1].axis("off")
 
-# (4) Overlay tra riferimento e 330 warppata
-if warped_330 is not None:
-    ref_rgb = img1
-    warped_rgb = warped_330[:, :, ::-1]  # BGR -> RGB
-    alpha = 0.5
-    overlay = (alpha * ref_rgb + (1 - alpha) * warped_rgb).astype(np.uint8)
-    axes[1, 1].imshow(overlay)
-    axes[1, 1].set_title("Overlay: 320 + warped 330")
-else:
-    axes[1, 1].text(0.5, 0.5, "No overlay", ha='center', va='center', fontsize=12)
-axes[1, 1].axis("off")
+    # 3) Warped -> reference
+    ax[2].imshow(warped2_bgr[:, :, ::-1])
+    ax[2].set_title("Warped -> Reference Frame")
+    ax[2].axis("off")
 
-plt.tight_layout()
-plt.savefig('homography_visualization.png', dpi=100, bbox_inches='tight')
-print("\nHomography visualization saved to: homography_visualization.png")
-plt.show()
+    # 4) Overlay reference + warped
+    ax[3].imshow(overlay2_bgr[:, :, ::-1])
+    ax[3].set_title("Overlay (Ref + Warped)")
+    ax[3].axis("off")
 
-# ==============================================================================
-# SAVE HOMOGRAPHIES
-# ==============================================================================
+    plt.tight_layout()
+    plt.savefig("warp_overlay_second.png", dpi=120, bbox_inches="tight")
+    print("Saved warp/overlay figure: warp_overlay_second.png")
+    plt.show()
 
-homography_data = {
-    'reference': ref_name,
-    'homographies': homographies,
-    'inlier_counts': inlier_counts,
-}
-np.save('homographies.npy', homography_data)
-print("Homographies saved to: homographies.npy")
+    # ----------------------------------------------------------
+    # PANORAMICA: tutte le immagini warpate nel frame della reference
+    # ----------------------------------------------------------
+    print("\nBuilding panorama (all images -> reference frame)...")
+
+    panorama_bgr = ref_img_bgr.copy()
+    for img_bgr, name in seq[1:]:
+        Hmat = homos.get(name, None)
+        if Hmat is None:
+            continue
+        warped_bgr = warp_numpy(img_bgr, Hmat, canvas_hw)
+        panorama_bgr = blend_numpy(panorama_bgr, warped_bgr, alpha=0.5)
+
+    plt.figure(figsize=(10, 5))
+    plt.imshow(panorama_bgr[:, :, ::-1])
+    plt.title("Panorama in Reference Frame")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig("panorama_reference_frame.png", dpi=120, bbox_inches="tight")
+    print("Saved panorama: panorama_reference_frame.png")
+    plt.show()
+
+    return {
+        "K": K,
+        "R": R,
+        "t": t,
+        "E": E,
+        "points3D": pts3d,
+        "homographies": homos,
+        "inliers_E": int(inlE.sum()),
+        "inliers_H": inliers_H,
+    }
+
+
+
+# Run pipeline
+if __name__ == "__main__":
+    results = run_pipeline(CONFIG)
+    np.save("lab2_results.npy", results)
+    print("\nSaved results to lab2_results.npy")
