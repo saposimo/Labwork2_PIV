@@ -16,14 +16,23 @@ from pathlib import Path
 # ==============================================================================
 
 CONFIG = {
-    "ref_name": "lisbon_0001.jpg",     # reference image
-    "prefix": "lisbon_",               # load only prefixXXX.jpg
+    "ref_name": "320.jpg",     # reference image
+    "prefix": "3",               # load only prefixXXX.jpg
     "max_images": 2,                  # max number of images to load
     "fx_fy": 1180.0,                   # camera intrinsics guess
     "ransac_E_thresh": 1e-3,           # RANSAC threshold for Essential
     "ransac_H_thresh": 4.0,            # RANSAC threshold for homography
     "ransac_iters": 2000,
 }
+
+# Config for the "3D point cloud from depth" section
+DEPTH_CONFIG = {
+    "enabled": True,               # set to False if you don't have depth data
+    "depth_file": "320_depth.npy", # name of the .npy file with depth map
+    "rgb_file": "320.jpg",         # registered RGB/BW image (to colorize points)
+    "fx_fy": 1180.0,               # intrinsics (estimate or value from dataset)
+}
+
 
 # ==============================================================================
 # IMAGE LOADING
@@ -102,7 +111,7 @@ def eight_point_E(pts1, pts2):
     _, _, Vt = np.linalg.svd(A)
     E = Vt[-1].reshape(3, 3)
 
-    # rank-2 enforcement
+    # Enforce rank-2 constraint
     U, _, Vt = np.linalg.svd(E)
     S = np.diag([1, 1, 0])
     return U @ S @ Vt
@@ -143,7 +152,7 @@ def estimate_E_ransac(pts1, pts2, K, thresh, iters):
     if best_E is None:
         raise RuntimeError("RANSAC failed for Essential.")
 
-    # refine
+    # Refine with all inliers
     E_ref = eight_point_E(pts1n[best_inliers], pts2n[best_inliers])
     return E_ref, best_inliers
 
@@ -299,21 +308,119 @@ def warp_numpy(img, H, out_wh):
 
 def blend_numpy(base_img, new_img, alpha=0.5):
     """
-    Fonde new_img dentro base_img solo dove new_img è valido (non nero).
-    Tutto in NumPy, niente OpenCV.
-    base_img, new_img: BGR, stessa shape.
+    Blends new_img into base_img only where new_img is valid (not black).
+    Pure NumPy, no OpenCV.
+    base_img, new_img: BGR, same shape.
     """
     out = base_img.copy()
-    # pixel validi: non tutti e tre i canali a zero
+    # Valid pixels: not all three channels are zero
     mask = np.any(new_img != 0, axis=2)
 
-    # blending solo sulla maschera
+    # Blending only on the mask
     base = base_img.astype(np.float32)
     new = new_img.astype(np.float32)
 
     out[mask] = (alpha * base[mask] + (1.0 - alpha) * new[mask]).astype(np.uint8)
     return out
 
+
+# ==============================================================================
+# POINT CLOUD FROM DEPTH (CAMERA 1)
+# ==============================================================================
+
+def run_depth_pointcloud(cfg=DEPTH_CONFIG):
+    """
+    Builds a 3D point cloud from a depth map Z(u,v) in camera 1.
+    Uses only NumPy + Matplotlib.
+    """
+    if not cfg.get("enabled", False):
+        print("\n[Depth] Skipping depth point cloud (DEPTH_CONFIG['enabled'] = False)")
+        return None
+
+    depth_path = Path(cfg["depth_file"])
+    if not depth_path.exists():
+        print(f"\n[Depth] File '{depth_path}' not found, skipping point cloud.")
+        return None
+
+    print("\n[Depth] Loading depth map and building 3D point cloud...")
+
+    # 1) Load depth (H,W); units as in dataset (e.g., meters or mm)
+    Z = np.load(str(depth_path)).astype(np.float32)   # shape: (H, W)
+
+    H_d, W_d = Z.shape
+    fx = fy = cfg["fx_fy"]
+    cx, cy = W_d / 2.0, H_d / 2.0
+
+    # 2) Pixel coordinates (u,v)
+    u = np.arange(W_d)
+    v = np.arange(H_d)
+    uu, vv = np.meshgrid(u, v)   # shape: (H,W)
+
+    # 3) Back-projection: from (u,v,Z) to (X,Y,Z) in camera 1
+    X = (uu - cx) * Z / fx
+    Y = (vv - cy) * Z / fy
+
+    # 4) Mask for valid points (Z > 0)
+    valid = Z > 0
+    Xv = X[valid].ravel()
+    Yv = Y[valid].ravel()
+    Zv = Z[valid].ravel()
+
+    pts3d = np.stack([Xv, Yv, Zv], axis=1)   # shape: (N,3)
+
+    print(f"[Depth] 3D points from depth: {pts3d.shape[0]}")
+
+    # 5) (Optional) Point colors using the registered RGB image
+    colors = None
+    rgb_path = Path(cfg["rgb_file"])
+    if rgb_path.exists():
+        img_bgr = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+        if img_bgr is not None:
+            img_rgb = img_bgr[:, :, ::-1]   # BGR -> RGB
+            colors = img_rgb[valid].reshape(-1, 3)
+            print(f"[Depth] Colors attached to {colors.shape[0]} points.")
+        else:
+            print(f"[Depth] Warning: '{rgb_path}' not readable, no colors.")
+    else:
+        print(f"[Depth] RGB file '{rgb_path}' not found, no colors.")
+
+    # 6) Fast visualization (sample some points to avoid millions of points)
+    max_show = 50000
+    if pts3d.shape[0] > max_show:
+        idx = np.random.choice(pts3d.shape[0], max_show, replace=False)
+        pts_vis = pts3d[idx]
+        cols_vis = colors[idx] if colors is not None else None
+    else:
+        pts_vis = pts3d
+        cols_vis = colors
+
+    fig = plt.figure(figsize=(8, 5))
+    ax = fig.add_subplot(111, projection="3d")
+    if cols_vis is not None:
+        # Normalize colors [0,255] -> [0,1]
+        ax.scatter(pts_vis[:, 0], pts_vis[:, 1], pts_vis[:, 2],
+                   s=1, c=cols_vis / 255.0)
+    else:
+        ax.scatter(pts_vis[:, 0], pts_vis[:, 1], pts_vis[:, 2],
+                   s=1, c=pts_vis[:, 2], cmap="viridis")
+    ax.set_title("3D point cloud from depth (camera 1)")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+    plt.savefig("depth_pointcloud.png", dpi=120, bbox_inches="tight")
+    print("[Depth] Saved depth point cloud figure: depth_pointcloud.png")
+    plt.show()
+
+    # 7) Save the point cloud to file
+    np.save("depth_pointcloud.npy", pts3d)
+    print("[Depth] Saved 3D points to depth_pointcloud.npy")
+
+    if colors is not None:
+        np.save("depth_pointcloud_colors.npy", colors)
+        print("[Depth] Saved colors to depth_pointcloud_colors.npy")
+
+    return pts3d
 
 # ==============================================================================
 # MAIN PIPELINE
@@ -333,13 +440,13 @@ def run_pipeline(config=CONFIG):
     print("K =\n", K)
 
     # ----------------------------------------------------------
-    # E / Pose / Triangulation (use first two images only)
+    # Essential matrix / Pose / Triangulation (use first two images only)
     # ----------------------------------------------------------
     print("\n--- SIFT Matching (ref <-> next) ---")
     pts1, pts2 = sift_match(seq[0][0], seq[1][0])
     print(f"Matches: {len(pts1)}")
 
-    print("\n--- Essential via RANSAC (NumPy) ---")
+    print("\n--- Essential matrix via RANSAC (NumPy) ---")
     E, inlE = estimate_E_ransac(
         pts1, pts2,
         K,
@@ -358,7 +465,7 @@ def run_pipeline(config=CONFIG):
     pts3d = triangulate_points(pts1E, pts2E, K, R, t)
     print(f"3D points: {len(pts3d)}")
 
-        # ----------------------------------------------------------
+    # ----------------------------------------------------------
     # Homographies for entire sequence
     # ----------------------------------------------------------
     print("\n--- Homographies to reference ---")
@@ -421,7 +528,7 @@ def run_pipeline(config=CONFIG):
     plt.show()
 
     # ----------------------------------------------------------
-    # PANORAMICA: tutte le immagini warpate nel frame della reference
+    # PANORAMA: all images warped into the reference frame
     # ----------------------------------------------------------
     print("\nBuilding panorama (all images -> reference frame)...")
 
@@ -457,6 +564,11 @@ def run_pipeline(config=CONFIG):
 
 # Run pipeline
 if __name__ == "__main__":
+    # 1) Point cloud from depth (camera 1)
+    run_depth_pointcloud(DEPTH_CONFIG)
+
+    # 2) Pipeline: Essential matrix / pose / triangulation / homographies / panorama
     results = run_pipeline(CONFIG)
     np.save("lab2_results.npy", results)
     print("\nSaved results to lab2_results.npy")
+
